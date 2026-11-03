@@ -1792,6 +1792,22 @@ class TestTransferReadyEvents(CustomTestCase):
         )
         self.assertEqual(linker.broadcast_loads, {})
 
+    def test_mooncake_layer_chunks_group_reads(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.num_layers = 5
+
+        linker.layer_chunk_size = 2
+        self.assertEqual(linker._layer_chunks(), ((0, 1), (2, 3), (4,)))
+
+        # One request per layer keeps the pre-chunking behavior reachable.
+        linker.layer_chunk_size = 1
+        self.assertEqual(linker._layer_chunks(), ((0,), (1,), (2,), (3,), (4,)))
+
+        # 0 - and any size past the last layer - reads the page in one request.
+        for chunk_size in (0, 5, 9):
+            linker.layer_chunk_size = chunk_size
+            self.assertEqual(linker._layer_chunks(), ((0, 1, 2, 3, 4),))
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
