@@ -77,6 +77,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config = deepcopy(extra_config or {})
+        # Layers read per store request. Each request is a round trip, so
+        # 1 serializes the load into one small RDMA batch per layer while 0
+        # sends the whole page in a single request.
+        self.layer_chunk_size = int(extra_config.get("layer_chunk_size", 0))
+        if self.layer_chunk_size < 0:
+            raise ValueError(
+                f"layer_chunk_size must be >= 0, got {self.layer_chunk_size}."
+            )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -119,6 +127,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_size,
             self.offload_owner,
             storage_suffix,
+        )
+        logger.info(
+            "Mooncake direct linker read plan: layers=%d, layer_chunk_size=%d",
+            self.num_layers,
+            self.layer_chunk_size,
         )
 
         self.register_buffers()
@@ -304,6 +317,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
+    def _layer_chunks(self) -> tuple[tuple[int, ...], ...]:
+        """Layer groups issued as one store request each.
+
+        The forward can start as soon as a group lands, so chunking trades tail
+        latency against request count; one request for everything keeps the
+        store-side batch maximal.
+        """
+        size = self.layer_chunk_size
+        if size <= 0 or size >= self.num_layers:
+            return (tuple(range(self.num_layers)),)
+        return tuple(
+            tuple(range(start, min(start + size, self.num_layers)))
+            for start in range(0, self.num_layers, size)
+        )
+
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
@@ -331,10 +359,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                 started.append(keys)
 
-            for layer in range(self.num_layers):
+            for chunk in self._layer_chunks():
                 for name, (keys, locations) in batches.items():
-                    meta = self.pools[name].get_prepared_layer_range_meta(
-                        locations, layer
+                    meta = self.pools[name].get_prepared_layer_group_meta(
+                        locations, chunk
                     )
                     if meta is None:
                         continue
@@ -353,10 +381,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     ):
                         raise RuntimeError(
                             f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
+                            f"layers={chunk}: transferred={result}, "
                             f"expected={expected}"
                         )
-                self.layer_done_counter.complete(counter_index, layer)
+                for layer in chunk:
+                    self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")

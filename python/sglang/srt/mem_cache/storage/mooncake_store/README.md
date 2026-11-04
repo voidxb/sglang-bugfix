@@ -43,6 +43,25 @@ ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
 Use matching model settings. KV format and host layout are not yet in the keys;
 use different `extra_backend_tag` values when these differ.
 
+### Direct linker (no host tier)
+
+`--enable-unified-cache-external-linker` skips the host tier entirely and links
+the device pools straight to the store. Mooncake backs it with one page layout
+per KV pool:
+
+* MLA (`MLATokenToKVPool`): one object per page holding every layer's latent KV.
+  MLA KV is replicated across TP ranks, so keys carry no tp suffix and only
+  rank 0 writes.
+* MHA/GQA (`MHATokenToKVPool`): one object per page holding the K rows of every
+  layer followed by the V rows. Keys keep the tp suffix, since the shards
+  differ per rank.
+
+Objects are page-granular (`--page-size`), so a prefix is restorable in whole
+pages only and a prompt shorter than one page reuses nothing. `layer_chunk_size`
+in `--unified-cache-external-linker-config` sets how many transfer layers share
+one read request: `0` reads a whole page in a single request, `1` reads one
+layer per request.
+
 ## Install Mooncake
 
 **Method 1: with pip**
